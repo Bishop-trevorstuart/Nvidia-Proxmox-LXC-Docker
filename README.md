@@ -55,10 +55,18 @@ sudo apt install -y dkms linux-headers build-essential libvulkan1
 ### Blacklist nouveau
 
 ```bash
-echo "blacklist nouveau" > /etc/modprobe.d/blacklist.conf
-echo "options nouveau modeset=0" >> /etc/modprobe.d/blacklist.conf
+# Blacklist nouveau driver (required before NVIDIA driver installation)
+# The open-source nouveau driver conflicts with the NVIDIA proprietary driver and must be disabled before installation.
+bash -c "echo blacklist nouveau > /etc/modprobe.d/blacklist-nvidia-nouveau.conf"
+bash -c "echo options nouveau modeset=0 >> /etc/modprobe.d/blacklist-nvidia-nouveau.conf"
+
+# Verify the configuration
+cat /etc/modprobe.d/blacklist-nvidia-nouveau.conf
+
+# Update initramfs to apply changes
 update-initramfs -u
 ```
+REBOOT
 
 ---
 
@@ -67,8 +75,15 @@ update-initramfs -u
 ### Download and install the latest version—check for your card at https://www.nvidia.com/en-us/drivers/unix/
 
 ```bash
-wget https://us.download.nvidia.com/XFree86/Linux-x86_64/570.172.08/NVIDIA-Linux-x86_64-570.172.08.run
-sh NVIDIA-Linux-x86_64-570.172.08.run --dkms
+wget https://us.download.nvidia.com/XFree86/Linux-x86_64/580.105.08/NVIDIA-Linux-x86_64-580.105.08.run
+# Optional: Verify download integrity (checksum available on NVIDIA website)
+# sha256sum NVIDIA-Linux-x86_64-580.105.08.run
+
+# Make installer executable
+chmod +x NVIDIA-Linux-x86_64-580.105.08.run
+
+# Install driver with DKMS support
+./NVIDIA-Linux-x86_64-580.105.08.run --dkms
 ```
 The installer has a few prompts. Skip secondary cards, No 32 bits, No X. Near end will ask about register kernel module sources with dkms - **YES**.
 
@@ -78,7 +93,7 @@ The installer has a few prompts. Skip secondary cards, No 32 bits, No X. Near en
 
 ```bash
 dkms status
-# Should show: nvidia, 570.172.08, <kernel-version>: installed
+# Should show: nvidia, 580.105.08, <kernel-version>: installed
 ```
 > If not present, repeat the installer after confirming both `pve-headers` and `dkms` are installed.
 
@@ -141,20 +156,29 @@ watch -n0.1 nvidia-smi
 ```bash
 ls -l /dev/nv* |grep -v nvme | grep crw | sed -e 's/.*root root\s*\(.*\),.*\/dev\/\(.*\)/lxc.cgroup2.devices.allow: c \1:* rwm\nlxc.mount.entry: \/dev\/\2 dev\/\2 none bind,optional,create=file/g'
 ```
-Should look something like this (Do not blindly copy the below):
+Should look something like this (While you CAN copy/paste the output of the above command, Do not blindly copy the below):
 ```
-lxc.cgroup2.devices.allow: c 195:* rw
-lxc.mount.entry: /dev/nvidia0 nvidia0 none bind,optional,create=file
-lxc.cgroup2.devices.allow: c 195:* rw
-lxc.mount.entry: /dev/nvidiactl nvidiactl none bind,optional,create=file
-lxc.cgroup2.devices.allow: c 195:* rw
-lxc.mount.entry: /dev/nvidia-modeset nvidia-modeset none bind,optional,create=file
-lxc.cgroup2.devices.allow: c 236:* rw
-lxc.mount.entry: /dev/nvidia-uvm nvidia-uvm none bind,optional,create=file
-lxc.cgroup2.devices.allow: c 236:* rw
-lxc.mount.entry: /dev/nvidia-uvm-tools nvidia-uvm-tools none bind,optional,create=file
-lxc.cgroup2.devices.allow: c 10:* rw
-lxc.mount.entry: /dev/nvram nvram none bind,optional,create=file
+lxc.cgroup2.devices.allow: c 226:0 rwm
+lxc.cgroup2.devices.allow: c 226:1 rwm
+lxc.cgroup2.devices.allow: c 226:128 rwm
+lxc.cgroup2.devices.allow: c 195:0 rwm
+lxc.cgroup2.devices.allow: c 195:255 rwm
+lxc.cgroup2.devices.allow: c 195:254 rwm
+lxc.cgroup2.devices.allow: c 509:0 rwm
+lxc.cgroup2.devices.allow: c 509:1 rwm
+lxc.cgroup2.devices.allow: c 234:1 rwm
+lxc.cgroup2.devices.allow: c 234:2 rwm
+lxc.mount.entry: /dev/card0 dev/card0 none bind,optional,create=file
+lxc.mount.entry: /dev/card1 dev/card1 none bind,optional,create=file
+lxc.mount.entry: /dev/renderD128 dev/renderD128 none bind,optional,create=file
+lxc.mount.entry: /dev/nvidia0 dev/nvidia0 none bind,optional,create=file
+lxc.mount.entry: /dev/nvidiactl dev/nvidiactl none bind,optional,create=file
+lxc.mount.entry: /dev/nvidia-modeset dev/nvidia-modeset none bind,optional,create=file
+lxc.mount.entry: /dev/nvidia-uvm dev/nvidia-uvm none bind,optional,create=file
+lxc.mount.entry: /dev/nvidia-uvm-tools dev/nvidia-uvm-tools none bind,optional,create=file
+lxc.mount.entry: /dev/nvidia-cap1 dev/nvidia-cap1 none bind,optional,create=file
+lxc.mount.entry: /dev/nvidia-cap2 dev/nvidia-cap2 none bind,optional,create=file
+lxc.mount.entry: /dev/dri dev/dri none bind,optional,create=dir
 ```
 
 > **Note:** For unprivileged LXCs with file/bind mounts, ensure correct UID/GID mapping for storage access.
@@ -163,27 +187,80 @@ lxc.mount.entry: /dev/nvram nvram none bind,optional,create=file
 
 # Inside the LXC container
 
+## OPTIONAL permissions you can adjust. 
+# 1. Add user to groups
+sudo usermod -aG video stumed
+sudo usermod -aG render stumed
+
+# 2. Create udev rule
+sudo bash -c 'cat > /etc/udev/rules.d/70-nvidia.rules << EOF
+# NVIDIA devices
+KERNEL=="nvidia", RUN+="/bin/bash -c \"/usr/bin/nvidia-smi -L && /bin/chmod 666 /dev/nvidia*\""
+KERNEL=="nvidia_uvm", RUN+="/bin/bash -c \"/usr/bin/nvidia-modprobe -c0 -u && /bin/chmod 666 /dev/nvidia-uvm*\""
+
+# DRI devices - set permissions to 0666 for all users
+KERNEL=="card[0-9]*", SUBSYSTEM=="drm", MODE="0666"
+KERNEL=="renderD[0-9]*", SUBSYSTEM=="drm", MODE="0666"
+EOF'
+
+# 3. Reload udev rules
+sudo udevadm control --reload-rules
+sudo udevadm trigger
+
+# 4. Log out and back in (for group changes to take effect)
+exit
+
+## Actual Driver install
 ## Build Nvidia driver & install Nvidia container toolkit
 
 ```bash
-wget https://us.download.nvidia.com/XFree86/Linux-x86_64/570.172.08/NVIDIA-Linux-x86_64-570.172.08.run
-sh NVIDIA-Linux-x86_64-570.172.08.run --no-kernel-module
+# Install Vulkan user-space library
+sudo apt install -y libvulkan1
+
+# Install driver without kernel module
+wget https://us.download.nvidia.com/XFree86/Linux-x86_64/580.105.08/NVIDIA-Linux-x86_64-580.105.08.run
+chmod +x NVIDIA-Linux-x86_64-580.105.08.run
+sudo ./NVIDIA-Linux-x86_64-580.105.08.run --no-kernel-module
 # The installer has a few prompts. Skip secondary cards, No 32 bits, No X 
 
-#############Install NVIDIA Container Toolkit
-apt install curl gpg
-curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey | gpg --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg \
-  && curl -s -L https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list | \
-    sed 's#deb https://#deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://#g' | \
-    tee /etc/apt/sources.list.d/nvidia-container-toolkit.list \
-  && \
-    apt-get update
+## This section installs the Nvidia container runtime
+# Install prerequisites
+sudo apt install -y curl gpg
 
-apt-get install -y nvidia-container-toolkit
+# Add NVIDIA Container Toolkit repository
+curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey | \
+  sudo gpg --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg
 
-nvidia-ctk runtime configure --runtime=docker
-systemctl restart docker
-sed -i -e 's/.*no-cgroups.*/no-cgroups = true/g' /etc/nvidia-container-runtime/config.toml
+curl -s -L https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list | \
+  sed 's#deb https://#deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://#g' | \
+  sudo tee /etc/apt/sources.list.d/nvidia-container-toolkit.list
+
+# Update package list
+sudo apt-get update
+
+# Install latest stable version (recommended for security updates)
+sudo apt-get install -y \
+  nvidia-container-toolkit \
+  nvidia-container-toolkit-base \
+  libnvidia-container-tools \
+  libnvidia-container1
+
+# CRITICAL: Enable no-cgroups for unprivileged LXC (BEFORE runtime config)
+sudo sed -i -e 's/.*no-cgroups.*/no-cgroups = true/g' /etc/nvidia-container-runtime/config.toml
+
+# Configure Docker runtime
+sudo nvidia-ctk runtime configure --runtime=docker
+
+# Verify no-cgroups setting
+grep "no-cgroups" /etc/nvidia-container-runtime/config.toml
+# Should output: no-cgroups = true
+
+# Restart Docker to apply changes
+sudo systemctl restart docker
+
+# Verify Docker runtime configuration
+docker info | grep -i runtime
+# Should show nvidia runtime available
 ```
 
 ---

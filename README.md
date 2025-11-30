@@ -152,33 +152,39 @@ watch -n0.1 nvidia-smi
 ---
 
 ## Add the output of this command to your LXC config file (/etc/pve/nodes/pve/lxc/xxx.conf)
-
 ```bash
-ls -l /dev/nv* |grep -v nvme | grep crw | sed -e 's/.*root root\s*\(.*\),.*\/dev\/\(.*\)/lxc.cgroup2.devices.allow: c \1:* rwm\nlxc.mount.entry: \/dev\/\2 dev\/\2 none bind,optional,create=file/g'
+# Generate cgroup permissions with wildcards (cleaner)
+echo "# DRI devices (video encode/decode)"
+echo "lxc.cgroup2.devices.allow: c 226:* rwm"
+echo ""
+echo "# NVIDIA CUDA devices"  
+echo "lxc.cgroup2.devices.allow: c 195:* rwm"
+echo "lxc.cgroup2.devices.allow: c 509:* rwm"
+echo "lxc.cgroup2.devices.allow: c 234:* rwm"
+echo ""
+echo "# Mount entries"
+echo "lxc.mount.entry: /dev/dri dev/dri none bind,optional,create=dir"
+
+# Then enumerate NVIDIA devices
+ls -l /dev/nvidia* 2>/dev/null | awk '/^crw/ {dev=$NF; gsub(/.*\//, "", dev); print "lxc.mount.entry: /dev/" dev " dev/" dev " none bind,optional,create=file"}'
 ```
-Should look something like this (While you CAN copy/paste the output of the above command, Do not blindly copy the below):
+The output can then be copy/pasted into your .conf file. Start from the # DRI Devices section and down. NOTE that the .conf files do not keep commented lines so those will get removed automagically when you start your LXC.  Do not blindly copy the below, as your system may have different output (it's an ex only):
 ```
-lxc.cgroup2.devices.allow: c 226:0 rwm
-lxc.cgroup2.devices.allow: c 226:1 rwm
-lxc.cgroup2.devices.allow: c 226:128 rwm
-lxc.cgroup2.devices.allow: c 195:0 rwm
-lxc.cgroup2.devices.allow: c 195:255 rwm
-lxc.cgroup2.devices.allow: c 195:254 rwm
-lxc.cgroup2.devices.allow: c 509:0 rwm
-lxc.cgroup2.devices.allow: c 509:1 rwm
-lxc.cgroup2.devices.allow: c 234:1 rwm
-lxc.cgroup2.devices.allow: c 234:2 rwm
-lxc.mount.entry: /dev/card0 dev/card0 none bind,optional,create=file
-lxc.mount.entry: /dev/card1 dev/card1 none bind,optional,create=file
-lxc.mount.entry: /dev/renderD128 dev/renderD128 none bind,optional,create=file
+# DRI devices (video encode/decode)
+lxc.cgroup2.devices.allow: c 226:* rwm
+
+# NVIDIA CUDA devices
+lxc.cgroup2.devices.allow: c 195:* rwm
+lxc.cgroup2.devices.allow: c 509:* rwm
+lxc.cgroup2.devices.allow: c 234:* rwm
+
+# Mount entries
+lxc.mount.entry: /dev/dri dev/dri none bind,optional,create=dir
 lxc.mount.entry: /dev/nvidia0 dev/nvidia0 none bind,optional,create=file
 lxc.mount.entry: /dev/nvidiactl dev/nvidiactl none bind,optional,create=file
 lxc.mount.entry: /dev/nvidia-modeset dev/nvidia-modeset none bind,optional,create=file
 lxc.mount.entry: /dev/nvidia-uvm dev/nvidia-uvm none bind,optional,create=file
 lxc.mount.entry: /dev/nvidia-uvm-tools dev/nvidia-uvm-tools none bind,optional,create=file
-lxc.mount.entry: /dev/nvidia-cap1 dev/nvidia-cap1 none bind,optional,create=file
-lxc.mount.entry: /dev/nvidia-cap2 dev/nvidia-cap2 none bind,optional,create=file
-lxc.mount.entry: /dev/dri dev/dri none bind,optional,create=dir
 ```
 
 > **Note:** For unprivileged LXCs with file/bind mounts, ensure correct UID/GID mapping for storage access.

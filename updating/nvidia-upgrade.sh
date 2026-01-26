@@ -60,17 +60,22 @@ check_deps() {
 }
 
 check_proxmox() {
-  if ! systemctl is-active --quiet pve 2>/dev/null; then
-    error "Proxmox not running"
+  if [[ ! -d /etc/pve ]]; then
+    error "Not running on Proxmox host (no /etc/pve directory)"
   fi
-  log "✓ Proxmox OK"
+  log "✓ Proxmox detected"
 }
 
 check_nvidia() {
   if ! nvidia-smi &>/dev/null; then
-    error "NVIDIA driver not installed"
+    if [[ "$DRY_RUN" == "true" ]]; then
+      warn "NVIDIA driver not detected (OK for DRY_RUN)"
+    else
+      error "NVIDIA driver not installed"
+    fi
+  else
+    log "✓ NVIDIA driver OK"
   fi
-  log "✓ NVIDIA driver OK"
 }
 
 get_current_version() {

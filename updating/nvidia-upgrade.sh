@@ -98,7 +98,8 @@ get_latest_version() {
 
 compare_versions() {
   [[ "$1" == "$2" ]] && return 0
-  [[ "$(printf '%s\n' "$1" "$2" | sort -V | head -n1)" == "$2" ]] && return 1 || return 2
+  # Returns 1 if $1 > $2 (upgrade), 2 if $1 < $2 (downgrade)
+  [[ "$(printf '%s\n' "$1" "$2" | sort -V | head -n1)" == "$1" ]] && return 2 || return 1
 }
 
 download_driver() {
@@ -343,15 +344,10 @@ main() {
     echo ""
   fi
   
-  echo "[DEBUG] About to check root..."
   check_root
-  echo "[DEBUG] Root check passed, checking deps..."
   check_deps
-  echo "[DEBUG] Deps check passed, checking Proxmox..."
   check_proxmox
-  echo "[DEBUG] Proxmox check passed, checking NVIDIA..."
   check_nvidia
-  echo "[DEBUG] All checks passed!"
   
   [[ -z "$NEW_VERSION" ]] && NEW_VERSION=$(get_latest_version) && log "Auto-detected: $NEW_VERSION"
   
@@ -367,7 +363,7 @@ main() {
   echo ""
   
   read -p "Continue? (yes/no): " -r
-  [[ ! $REPLY =~ ^[Yy][Ee][Ss]$ ]] && log "Cancelled" && exit 0
+  [[ ! $REPLY =~ ^[Yy]([Ee][Ss])?$ ]] && log "Cancelled" && exit 0
   
   [[ "$AUTO_DOWNLOAD" == "true" ]] && [[ "$DRY_RUN" == "false" ]] && download_driver "$NEW_VERSION" || DRIVER_FILE="/root/NVIDIA-Linux-x86_64-${NEW_VERSION}.run"
   [[ ! -f "$DRIVER_FILE" ]] && error "Driver not found: $DRIVER_FILE"

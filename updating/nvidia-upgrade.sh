@@ -19,10 +19,27 @@ LXC_CONTAINERS="${LXC_CONTAINERS:-}"
 NEEDS_REBOOT_HOST=0
 NEEDS_REBOOT_CONTAINERS=()
 
-log() { echo -e "${GREEN}[$(date +'%Y-%m-%d %H:%M:%S')]${NC} $*" | tee -a "$LOG_FILE"; }
-warn() { echo -e "${YELLOW}[WARN]${NC} $*" | tee -a "$LOG_FILE"; }
-error() { echo -e "${RED}[ERROR]${NC} $*" | tee -a "$LOG_FILE"; exit 1; }
-info() { echo -e "${BLUE}[INFO]${NC} $*" | tee -a "$LOG_FILE"; }
+log() { 
+  local msg="[$(date +'%Y-%m-%d %H:%M:%S')] $*"
+  echo -e "${GREEN}${msg}${NC}" 
+  echo "$msg" >> "$LOG_FILE" 2>/dev/null || echo "$msg" >> /tmp/nvidia-upgrade-fallback.log
+}
+warn() { 
+  local msg="[WARN] $*"
+  echo -e "${YELLOW}${msg}${NC}" 
+  echo "$msg" >> "$LOG_FILE" 2>/dev/null || echo "$msg" >> /tmp/nvidia-upgrade-fallback.log
+}
+error() { 
+  local msg="[ERROR] $*"
+  echo -e "${RED}${msg}${NC}" >&2
+  echo "$msg" >> "$LOG_FILE" 2>/dev/null || echo "$msg" >> /tmp/nvidia-upgrade-fallback.log
+  exit 1
+}
+info() { 
+  local msg="[INFO] $*"
+  echo -e "${BLUE}${msg}${NC}" 
+  echo "$msg" >> "$LOG_FILE" 2>/dev/null || echo "$msg" >> /tmp/nvidia-upgrade-fallback.log
+}
 
 section() {
   echo ""

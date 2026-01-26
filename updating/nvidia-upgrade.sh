@@ -145,7 +145,7 @@ download_driver() {
         
         # Verify it's a valid file (> 100MB)
         local file_size
-        file_size=$(stat -f%z "$target_file" 2>/dev/null || stat -c%s "$target_file" 2>/dev/null || echo 0)
+        file_size=$(stat -c%s "$target_file" 2>/dev/null || echo 0)
         if [[ $file_size -gt 100000000 ]]; then
             DRIVER_FILE="$target_file"
             return 0

@@ -1,6 +1,6 @@
 #!/bin/bash
 # NVIDIA Driver Upgrade Script for Proxmox + LXC (NO REBOOT)
-set -euo pipefail
+set -u
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -35,18 +35,24 @@ check_root() { [[ $EUID -ne 0 ]] && error "Must run as root"; }
 check_deps() {
   local deps=("wget" "curl" "pct" "nvidia-smi" "dkms")
   for dep in "${deps[@]}"; do
-    command -v "$dep" &>/dev/null || error "Missing: $dep"
+    if ! command -v "$dep" &>/dev/null; then
+      error "Missing: $dep"
+    fi
   done
   log "✓ Dependencies OK"
 }
 
 check_proxmox() {
-  systemctl is-active --quiet pve || error "Proxmox not running"
+  if ! systemctl is-active --quiet pve 2>/dev/null; then
+    error "Proxmox not running"
+  fi
   log "✓ Proxmox OK"
 }
 
 check_nvidia() {
-  nvidia-smi &>/dev/null || error "NVIDIA driver not installed"
+  if ! nvidia-smi &>/dev/null; then
+    error "NVIDIA driver not installed"
+  fi
   log "✓ NVIDIA driver OK"
 }
 
@@ -76,7 +82,7 @@ compare_versions() {
 download_driver() {
     local version="$1"
     local filename="NVIDIA-Linux-x86_64-${version}.run"
-    local url="${NVIDIA_DOWNLOAD_BASE}/${version}/${filename}"
+    local url="${NVIDIA_API_URL}/${version}/${filename}"
     local target_file="/root/${filename}"
     
     if [[ -f "$target_file" ]]; then
@@ -84,7 +90,7 @@ download_driver() {
         
         # Verify it's a valid file (> 100MB)
         local file_size
-        file_size=$(stat -f%z "$target_file" 2>/dev/null || stat -c%s "$target_file" 2>/dev/null || echo 0)
+        file_size=$(stat -c%s "$target_file" 2>/dev/null || echo 0)
         if [[ $file_size -gt 100000000 ]]; then
             DRIVER_FILE="$target_file"
             return 0
@@ -307,6 +313,13 @@ show_summary() {
 main() {
   section "NVIDIA Driver Upgrade (No Reboot)"
   log "Started"
+  echo ""
+  
+  if [[ "$DRY_RUN" == "true" ]]; then
+    warn "DRY RUN MODE - No changes will be made"
+    warn "Results will be logged to: $LOG_FILE"
+    echo ""
+  fi
   
   check_root
   check_deps
@@ -332,7 +345,7 @@ main() {
   [[ "$AUTO_DOWNLOAD" == "true" ]] && [[ "$DRY_RUN" == "false" ]] && download_driver "$NEW_VERSION" || DRIVER_FILE="/root/NVIDIA-Linux-x86_64-${NEW_VERSION}.run"
   [[ ! -f "$DRIVER_FILE" ]] && error "Driver not found: $DRIVER_FILE"
   
-  detect_containers
+  detect_lxc_containers
   
   upgrade_host
   

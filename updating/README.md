@@ -1,3 +1,5 @@
+Script is meant to run from the proxmox host (not a VM or container).
+
 Usage Examples
 1. Fully Automatic Mode (Recommended)
 bash

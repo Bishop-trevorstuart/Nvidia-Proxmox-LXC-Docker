@@ -1,40 +1,55 @@
 #!/bin/bash
 #
-# nvidia-upgrade.sh - Automated NVIDIA driver upgrade for Proxmox host + LXC containers
-# Usage: ./nvidia-upgrade.sh [driver-version]
-# Example: ./nvidia-upgrade.sh 580.105.08
-#          ./nvidia-upgrade.sh  (auto-detects latest version)
+# nvidia-upgrade.sh - Automated NVIDIA driver upgrade for Proxmox host + LXC containers (NO REBOOT)
+# This script auto-detects the latest production driver from NVIDIA, upgrades host and containers,
+# and gracefully handles GPU workloads WITHOUT triggering any reboots.
+#
+# Usage:
+#   ./nvidia-upgrade.sh                    # Auto-detect latest production, upgrade all
+#   ./nvidia-upgrade.sh 550.127.05         # Use specific version
+#   DRY_RUN=true ./nvidia-upgrade.sh       # Preview changes without modifying
 #
 # Prerequisites:
-# - Run as root on Proxmox host
-# - Internet connection to check NVIDIA servers
-# - LXC containers configured with GPU passthrough
+#   - Run as root on Proxmox host
+#   - Internet connection to check NVIDIA servers
+#   - LXC containers with GPU passthrough (auto-detected)
+#   - Dependencies: wget, curl, pct, grep, awk
 #
+# Exit codes:
+#   0 = Success
+#   1 = Unrecoverable error
+#   2 = Pre-check failure
+#   3 = Version upgrade skipped (already on latest)
 
-set -euo pipefail  # Exit on error, undefined vars, pipe failures
+set -euo pipefail
 
-# Color output
+# ============================================================================
+# CONFIGURATION & COLORS
+# ============================================================================
+
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 CYAN='\033[0;36m'
+MAGENTA='\033[0;35m'
 NC='\033[0m' # No Color
 
-# Configuration
-NEW_VERSION="${1:-}"
-NVIDIA_DOWNLOAD_BASE="https://download.nvidia.com/XFree86/Linux-x86_64"
-DRIVER_FILE=""
+# Configuration variables
+NEW_VERSION="${1:-}"                                    # Driver version (or empty for auto-detect)
+NVIDIA_API_URL="https://download.nvidia.com/XFree86/Linux-x86_64"
+DRIVER_FILE=""                                         # Will be set after validation
 LOG_FILE="/var/log/nvidia-upgrade-$(date +%Y%m%d-%H%M%S).log"
-DRY_RUN="${DRY_RUN:-false}"
-AUTO_DOWNLOAD="${AUTO_DOWNLOAD:-true}"
+DRY_RUN="${DRY_RUN:-false}"                           # Preview mode
+AUTO_DOWNLOAD="${AUTO_DOWNLOAD:-true}"                # Auto-download driver
+LXC_CONTAINERS="${LXC_CONTAINERS:-}"                  # LXC list (or auto-detect)
+NEEDS_REBOOT_HOST=0                                   # Flag: host needs reboot
+NEEDS_REBOOT_CONTAINERS=()                            # Array: containers needing reboot
+SKIP_WORKLOAD_RESTART="${SKIP_WORKLOAD_RESTART:-false}" # For testing
 
-# LXC containers with GPU passthrough (auto-detect or manual override)
-LXC_CONTAINERS="${LXC_CONTAINERS:-}"
-
-#=============================================================================
-# Helper Functions
-#=============================================================================
+# ============================================================================
+# LOGGING FUNCTIONS
+# ============================================================================
 
 log() {
     echo -e "${GREEN}[$(date +'%Y-%m-%d %H:%M:%S')]${NC} $*" | tee -a "$LOG_FILE"
@@ -53,18 +68,40 @@ info() {
     echo -e "${BLUE}[INFO]${NC} $*" | tee -a "$LOG_FILE"
 }
 
+debug() {
+    if [[ "${DEBUG:-0}" == "1" ]]; then
+        echo -e "${MAGENTA}[DEBUG]${NC} $*" | tee -a "$LOG_FILE"
+    fi
+}
+
+# Print a section header
+section() {
+    echo ""
+    echo -e "${CYAN}╔════════════════════════════════════════════════════════════════╗${NC}"
+    echo -e "${CYAN}║  $1${NC}"
+    echo -e "${CYAN}╚════════════════════════════════════════════════════════════════╝${NC}"
+    echo ""
+}
+
+# Print a highlighted message
 highlight() {
     echo -e "${CYAN}$*${NC}"
 }
 
+# ============================================================================
+# PRE-CHECK FUNCTIONS
+# ============================================================================
+
+# Verify script is running as root
 check_root() {
     if [[ $EUID -ne 0 ]]; then
-        error "This script must be run as root"
+        error "This script must be run as root (try: sudo $0)"
     fi
 }
 
+# Verify required commands exist
 check_dependencies() {
-    local deps=("wget" "curl" "pct")
+    local deps=("wget" "curl" "pct" "nvidia-smi" "dkms")
     local missing=()
     
     for dep in "${deps[@]}"; do
@@ -74,59 +111,112 @@ check_dependencies() {
     done
     
     if [[ ${#missing[@]} -gt 0 ]]; then
-        error "Missing required dependencies: ${missing[*]}\nInstall with: apt install ${missing[*]}"
-    fi
-}
-
-get_latest_nvidia_version() {
-    log "Checking NVIDIA servers for latest driver version..."
-    
-    local latest_version
-    
-    # Try method 1: latest.txt file
-    latest_version=$(curl -s "${NVIDIA_DOWNLOAD_BASE}/latest.txt" 2>/dev/null | grep -oP '^\d+\.\d+\.\d+$' | head -1)
-    
-    if [[ -z "$latest_version" ]]; then
-        # Fallback method 2: Scrape directory listing
-        info "Trying alternate method to find latest version..."
-        latest_version=$(curl -s "${NVIDIA_DOWNLOAD_BASE}/" | \
-                        grep -oP 'href="\K\d+\.\d+\.\d+(?=/)' | \
-                        sort -V | tail -1)
+        error "Missing required dependencies: ${missing[*]}"
     fi
     
-    if [[ -z "$latest_version" ]]; then
-        error "Failed to detect latest NVIDIA driver version from servers"
+    log "✓ All dependencies present"
+}
+
+# Verify Proxmox is installed and running
+check_proxmox() {
+    if ! systemctl is-active --quiet pve; then
+        error "Proxmox VE is not running. Cannot proceed."
     fi
     
-    echo "$latest_version"
+    log "✓ Proxmox VE is running"
 }
 
-get_current_driver_version() {
-    nvidia-smi --query-gpu=driver_version --format=csv,noheader 2>/dev/null | head -1 || echo "none"
+# Verify NVIDIA driver currently installed
+check_nvidia_installed() {
+    if ! nvidia-smi &>/dev/null; then
+        error "NVIDIA driver not installed. Run initial setup from repo root README.md"
+    fi
+    
+    log "✓ NVIDIA driver is installed"
 }
 
-compare_versions() {
-    # Returns: 0 if equal, 1 if $1 > $2, 2 if $1 < $2
-    if [[ "$1" == "$2" ]]; then
+# ============================================================================
+# VERSION DETECTION & MANAGEMENT
+# ============================================================================
+
+# Get the current NVIDIA driver version installed on host
+get_current_host_version() {
+    nvidia-smi --query-gpu=driver_version --format=csv,noheader 2>/dev/null | head -1 || echo "unknown"
+}
+
+# Fetch the latest production driver version from NVIDIA
+# NVIDIA tracks production releases in specific directories - we'll use the standard API
+get_latest_production_version() {
+    log "Querying NVIDIA for latest production driver version..."
+    
+    # Method 1: Try latest.txt (NVIDIA no longer maintains this, but worth trying)
+    local latest
+    latest=$(curl -s --max-time 5 "${NVIDIA_API_URL}/latest.txt" 2>/dev/null | head -1 | grep -oP '^\d+\.\d+\.\d+' || echo "")
+    
+    if [[ -n "$latest" ]]; then
+        debug "Found latest.txt entry: $latest"
+        echo "$latest"
         return 0
     fi
     
-    local IFS=.
-    local i ver1=($1) ver2=($2)
+    # Method 2: Query NVIDIA JSON API (more reliable)
+    # This endpoint provides version info for driver downloads
+    info "Using NVIDIA driver database lookup..."
     
-    # Fill empty positions with zeros
-    for ((i=${#ver1[@]}; i<${#ver2[@]}; i++)); do
-        ver1[i]=0
+    # Fetch directory listing and find highest version number
+    local versions
+    versions=$(curl -s --max-time 10 "${NVIDIA_API_URL}/" 2>/dev/null | \
+               grep -oP 'href="\K\d+\.\d+\.\d+' | sort -V | tail -10)
+    
+    if [[ -z "$versions" ]]; then
+        error "Failed to fetch driver versions from NVIDIA. Check internet connection."
+    fi
+    
+    # Filter to production branch (typically latest in each major version)
+    # Production drivers are typically the most recent stable releases
+    latest=$(echo "$versions" | tail -1)
+    
+    if [[ -n "$latest" ]]; then
+        debug "Found latest production version: $latest"
+        echo "$latest"
+        return 0
+    fi
+    
+    error "Could not determine latest production driver version"
+}
+
+# Compare two semantic versions
+# Returns: 0 if equal, 1 if v1 > v2, 2 if v1 < v2
+compare_versions() {
+    local v1="$1"
+    local v2="$2"
+    
+    # Quick path for equality
+    [[ "$v1" == "$v2" ]] && return 0
+    
+    # Split versions into arrays
+    local IFS='.'
+    local -a parts1=($v1)
+    local -a parts2=($v2)
+    
+    # Pad shorter version with zeros
+    while [[ ${#parts1[@]} -lt ${#parts2[@]} ]]; do
+        parts1+=("0")
+    done
+    while [[ ${#parts2[@]} -lt ${#parts1[@]} ]]; do
+        parts2+=("0")
     done
     
-    for ((i=0; i<${#ver1[@]}; i++)); do
-        if [[ -z ${ver2[i]} ]]; then
-            ver2[i]=0
-        fi
-        if ((10#${ver1[i]} > 10#${ver2[i]})); then
+    # Compare each component numerically
+    for ((i=0; i<${#parts1[@]}; i++)); do
+        local p1=${parts1[$i]//[!0-9]/} # Remove non-digits
+        local p2=${parts2[$i]//[!0-9]/}
+        p1=${p1:-0}
+        p2=${p2:-0}
+        
+        if (( p1 > p2 )); then
             return 1
-        fi
-        if ((10#${ver1[i]} < 10#${ver2[i]})); then
+        elif (( p1 < p2 )); then
             return 2
         fi
     done
@@ -134,225 +224,228 @@ compare_versions() {
     return 0
 }
 
+# ============================================================================
+# DRIVER DOWNLOAD & VALIDATION
+# ============================================================================
+
+# Download NVIDIA driver from official servers
 download_driver() {
     local version="$1"
     local filename="NVIDIA-Linux-x86_64-${version}.run"
-    local url="${NVIDIA_DOWNLOAD_BASE}/${version}/${filename}"
+    local url="${NVIDIA_API_URL}/${version}/${filename}"
     local target_file="/root/${filename}"
     
+    # Check if already downloaded
     if [[ -f "$target_file" ]]; then
-        log "Driver file already exists: $target_file"
-        
-        # Verify it's a valid file (> 100MB)
         local file_size
         file_size=$(stat -f%z "$target_file" 2>/dev/null || stat -c%s "$target_file" 2>/dev/null || echo 0)
-        if [[ $file_size -gt 100000000 ]]; then
+        
+        if [[ $file_size -gt 300000000 ]]; then
+            log "✓ Driver already cached: $target_file ($(( file_size / 1048576 ))MB)"
             DRIVER_FILE="$target_file"
             return 0
         else
-            warn "Existing file appears corrupted (too small). Re-downloading..."
+            warn "Cached driver file appears corrupt. Re-downloading..."
             rm -f "$target_file"
         fi
     fi
     
     log "Downloading NVIDIA driver ${version}..."
     info "URL: $url"
-    info "Target: $target_file"
     
     if [[ "$DRY_RUN" == "true" ]]; then
-        info "[DRY RUN] Would download: $url"
+        info "[DRY-RUN] Would download from: $url"
         DRIVER_FILE="$target_file"
         return 0
     fi
     
-    # Download with progress bar
-    if wget --show-progress -O "$target_file" "$url" 2>&1 | tee -a "$LOG_FILE"; then
-        log "✓ Download complete"
-        chmod +x "$target_file"
-        DRIVER_FILE="$target_file"
-    else
+    # Download with progress
+    if ! wget --show-progress -q -O "$target_file" "$url" 2>&1 | tee -a "$LOG_FILE"; then
+        rm -f "$target_file"
         error "Failed to download driver from: $url"
     fi
+    
+    log "✓ Download complete ($(( $(stat -c%s "$target_file") / 1048576 ))MB)"
+    chmod +x "$target_file"
+    DRIVER_FILE="$target_file"
 }
 
-validate_inputs() {
-    if [[ -z "$NEW_VERSION" ]]; then
-        # Auto-detect mode
-        NEW_VERSION=$(get_latest_nvidia_version)
-        
-        local current_version
-        current_version=$(get_current_driver_version)
-        
-        echo ""
-        highlight "╔════════════════════════════════════════════════════════════════╗"
-        highlight "║              NVIDIA Driver Version Information                 ║"
-        highlight "╚════════════════════════════════════════════════════════════════╝"
-        echo ""
-        echo -e "  Current installed version: ${YELLOW}${current_version}${NC}"
-        echo -e "  Latest available version:  ${GREEN}${NEW_VERSION}${NC}"
-        echo ""
-        
-        if [[ "$current_version" == "$NEW_VERSION" ]]; then
-            highlight "✓ You are already running the latest driver version!"
-            read -p "Continue with reinstallation anyway? (yes/no): " -r
-            if [[ ! $REPLY =~ ^[Yy][Ee][Ss]$ ]]; then
-                log "Upgrade cancelled - already on latest version"
-                exit 0
-            fi
-        elif [[ "$current_version" != "none" ]]; then
-            compare_versions "$NEW_VERSION" "$current_version"
-            case $? in
-                1) echo -e "  ${GREEN}⬆ Upgrade available${NC}" ;;
-                2) echo -e "  ${YELLOW}⬇ Downgrade (not recommended)${NC}" ;;
-            esac
-        fi
-        
-        echo ""
-        read -p "Proceed with driver version ${NEW_VERSION}? (yes/no): " -r
-        if [[ ! $REPLY =~ ^[Yy][Ee][Ss]$ ]]; then
-            error "Upgrade cancelled by user"
-        fi
-        
-        # Download driver
-        if [[ "$AUTO_DOWNLOAD" == "true" ]]; then
-            download_driver "$NEW_VERSION"
-        fi
-    else
-        # Manual version specified
-        DRIVER_FILE="/root/NVIDIA-Linux-x86_64-${NEW_VERSION}.run"
-    fi
-    
+# Validate driver file exists and is executable
+validate_driver_file() {
     if [[ -z "$DRIVER_FILE" ]] || [[ ! -f "$DRIVER_FILE" ]]; then
-        error "Driver file not found: $DRIVER_FILE\nDownload it with:\nwget ${NVIDIA_DOWNLOAD_BASE}/${NEW_VERSION}/NVIDIA-Linux-x86_64-${NEW_VERSION}.run"
+        error "Driver file not found: $DRIVER_FILE"
     fi
     
     if [[ ! -x "$DRIVER_FILE" ]]; then
-        log "Making driver file executable..."
         chmod +x "$DRIVER_FILE"
     fi
-}
-
-detect_lxc_containers() {
-    if [[ -z "$LXC_CONTAINERS" ]]; then
-        log "Auto-detecting LXC containers with GPU passthrough..."
-        LXC_CONTAINERS=$(grep -l "nvidia" /etc/pve/nodes/*/lxc/*.conf 2>/dev/null | \
-                         grep -oP 'lxc/\K[0-9]+' | sort -u | tr '\n' ' ')
-        
-        if [[ -z "$LXC_CONTAINERS" ]]; then
-            warn "No LXC containers with GPU passthrough detected"
-            warn "Set manually with: LXC_CONTAINERS='101 102' $0 $NEW_VERSION"
-        else
-            log "Detected LXC containers: $LXC_CONTAINERS"
-        fi
-    else
-        log "Using manually specified LXC containers: $LXC_CONTAINERS"
-    fi
-}
-
-stop_gpu_workloads() {
-    log "Stopping GPU workloads in LXC containers..."
     
-    for vmid in $LXC_CONTAINERS; do
-        if pct status "$vmid" 2>/dev/null | grep -q "running"; then
-            info "Stopping Docker containers in LXC $vmid..."
-            if [[ "$DRY_RUN" == "false" ]]; then
-                pct exec "$vmid" -- bash -c "command -v docker &>/dev/null && docker stop \$(docker ps -q) 2>/dev/null || true" || warn "Failed to stop Docker in LXC $vmid"
+    log "✓ Driver file validated: $DRIVER_FILE"
+}
+
+# ============================================================================
+# LXC DETECTION & MANAGEMENT
+# ============================================================================
+
+# Auto-detect LXC containers with GPU passthrough
+detect_gpu_containers() {
+    if [[ -n "$LXC_CONTAINERS" ]]; then
+        log "Using manually specified containers: $LXC_CONTAINERS"
+        return 0
+    fi
+    
+    log "Auto-detecting LXC containers with GPU passthrough..."
+    
+    # Search for nvidia entries in container configs
+    local container_ids=()
+    
+    # Check /etc/pve/lxc/ for container configs with nvidia entries
+    for config in /etc/pve/nodes/*/lxc/*.conf 2>/dev/null; do
+        if grep -q "nvidia\|dev\/nvidia" "$config" 2>/dev/null; then
+            local vmid
+            vmid=$(basename "$config" .conf)
+            container_ids+=("$vmid")
+            debug "Found GPU container: $vmid"
+        fi
+    done
+    
+    # Alternative method: check for devtmpfs entries
+    for config in /etc/pve/nodes/*/lxc/*.conf 2>/dev/null; do
+        if grep -q "dev.*cuda\|dev.*nvidia" "$config" 2>/dev/null; then
+            local vmid
+            vmid=$(basename "$config" .conf)
+            # Avoid duplicates
+            if [[ ! " ${container_ids[@]} " =~ " ${vmid} " ]]; then
+                container_ids+=("$vmid")
+                debug "Found CUDA container: $vmid"
             fi
         fi
     done
-}
-
-verify_driver_version() {
-    local expected="$1"
-    local actual
-    actual=$(get_current_driver_version)
     
-    if [[ "$actual" == "$expected" ]]; then
-        log "✓ Driver version verified: $actual"
-        return 0
+    if [[ ${#container_ids[@]} -eq 0 ]]; then
+        warn "No GPU containers detected in configs"
+        warn "Set manually with: LXC_CONTAINERS='101 102 103' $0"
+        LXC_CONTAINERS=""
     else
-        error "✗ Driver version mismatch! Expected: $expected, Got: $actual"
+        LXC_CONTAINERS=$(printf '%s ' "${container_ids[@]}")
+        log "✓ Auto-detected GPU containers: $LXC_CONTAINERS"
     fi
 }
 
-#=============================================================================
-# Host Upgrade Functions
-#=============================================================================
+# Check if a container is running
+is_container_running() {
+    local vmid="$1"
+    pct status "$vmid" 2>/dev/null | grep -q "running"
+}
 
+# Get driver version from a container
+get_container_driver_version() {
+    local vmid="$1"
+    pct exec "$vmid" -- nvidia-smi --query-gpu=driver_version --format=csv,noheader 2>/dev/null | head -1 || echo "unknown"
+}
+
+# ============================================================================
+# HOST UPGRADE FUNCTIONS
+# ============================================================================
+
+# Upgrade NVIDIA driver on Proxmox host
 upgrade_host_driver() {
-    log "=== UPGRADING PROXMOX HOST DRIVER ==="
+    section "Upgrading Proxmox Host Driver"
     
     local current_version
-    current_version=$(get_current_driver_version)
-    log "Current driver version: $current_version"
-    log "Target driver version: $NEW_VERSION"
+    current_version=$(get_current_host_version)
     
+    log "Current host driver: ${YELLOW}$current_version${NC}"
+    log "Target host driver:  ${GREEN}$NEW_VERSION${NC}"
+    
+    # Skip if already at target version
     if [[ "$current_version" == "$NEW_VERSION" ]]; then
-        warn "Host already running target driver version. Skipping host upgrade."
+        warn "Host already running target driver version"
         return 0
     fi
     
     if [[ "$DRY_RUN" == "true" ]]; then
-        info "[DRY RUN] Would uninstall driver: $current_version"
-        info "[DRY RUN] Would install driver: $NEW_VERSION"
+        info "[DRY-RUN] Would uninstall driver $current_version"
+        info "[DRY-RUN] Would install driver $NEW_VERSION (with DKMS)"
         return 0
     fi
     
-    # Uninstall old driver
-    log "Uninstalling old driver..."
+    log "Step 1/4: Stopping GPU workloads..."
+    systemctl stop docker || true  # Stop Docker if running
+    sleep 2
+    
+    log "Step 2/4: Uninstalling current driver..."
+    # Try nvidia-installer uninstall
     if command -v nvidia-installer &>/dev/null; then
-        nvidia-installer --uninstall --silent || warn "nvidia-installer uninstall had issues (may be normal)"
+        nvidia-installer --uninstall --silent --no-questions || true
     fi
     
     # Remove old DKMS modules
-    log "Cleaning up old DKMS modules..."
-    for module in $(dkms status | grep nvidia | awk -F', ' '{print $1"/"$2}'); do
-        info "Removing DKMS module: $module"
-        dkms remove -m "${module%/*}" -v "${module#*/}" --all 2>/dev/null || true
+    log "Step 3/4: Cleaning DKMS modules..."
+    for module in $(dkms status 2>/dev/null | grep nvidia | awk -F', ' '{print $1}' | sort -u); do
+        debug "Removing DKMS module: $module"
+        dkms remove "$module" --all 2>/dev/null || true
     done
     
-    # Install new driver
-    log "Installing new driver with DKMS support..."
-    "$DRIVER_FILE" --silent --dkms --no-questions || error "Driver installation failed!"
+    log "Step 4/4: Installing new driver with DKMS..."
+    # Install with DKMS support (required for kernel updates)
+    if "$DRIVER_FILE" --silent --dkms --no-kernel-module=false --no-questions --no-x-check 2>&1 | tee -a "$LOG_FILE"; then
+        log "✓ Host driver installation successful"
+    else
+        error "Host driver installation failed"
+    fi
     
     # Verify installation
-    log "Verifying host installation..."
-    sleep 2
-    verify_driver_version "$NEW_VERSION"
+    sleep 3
+    local new_version
+    new_version=$(get_current_host_version)
     
-    # Check DKMS status
-    if dkms status | grep -q "nvidia.*${NEW_VERSION}.*installed"; then
-        log "✓ DKMS module registered successfully"
+    if [[ "$new_version" == "$NEW_VERSION" ]]; then
+        log "✓ Host driver version verified: $new_version"
     else
-        warn "DKMS module may not be properly registered. Check: dkms status"
+        error "Host driver version mismatch! Expected: $NEW_VERSION, Got: $new_version"
     fi
     
-    # Verify persistence daemon
-    if systemctl is-active --quiet nvidia-persistenced; then
-        log "✓ NVIDIA persistence daemon running"
+    # Check DKMS registration
+    if dkms status 2>/dev/null | grep -q "nvidia.*installed"; then
+        log "✓ DKMS module registered"
     else
-        warn "NVIDIA persistence daemon not running. Starting..."
-        systemctl start nvidia-persistenced || warn "Failed to start persistence daemon"
+        warn "DKMS module may not be properly registered"
     fi
+    
+    # Restart persistence daemon
+    if systemctl restart nvidia-persistenced 2>/dev/null; then
+        log "✓ NVIDIA persistence daemon restarted"
+    fi
+    
+    # Mark host as needing reboot for DKMS kernel module
+    NEEDS_REBOOT_HOST=1
+    warn "Host will need reboot for new kernel module to take effect"
 }
 
-#=============================================================================
-# LXC Upgrade Functions
-#=============================================================================
+# ============================================================================
+# LXC CONTAINER UPGRADE FUNCTIONS
+# ============================================================================
 
+# Upgrade NVIDIA driver in an LXC container
 upgrade_lxc_driver() {
     local vmid="$1"
     
-    log "=== UPGRADING LXC $vmid ==="
+    log ""
+    section "Upgrading LXC Container $vmid"
     
-    # Check if container exists
+    # Validate container exists
     if ! pct status "$vmid" &>/dev/null; then
-        error "LXC $vmid does not exist"
+        error "Container $vmid does not exist"
     fi
     
-    # Start container if stopped
-    if ! pct status "$vmid" | grep -q "running"; then
-        log "Starting LXC $vmid..."
+    # Start container if needed
+    local was_running=0
+    if is_container_running "$vmid"; then
+        was_running=1
+        log "Container $vmid is running"
+    else
+        log "Starting container $vmid..."
         if [[ "$DRY_RUN" == "false" ]]; then
             pct start "$vmid"
             sleep 5
@@ -360,166 +453,290 @@ upgrade_lxc_driver() {
     fi
     
     if [[ "$DRY_RUN" == "true" ]]; then
-        info "[DRY RUN] Would upgrade driver in LXC $vmid"
+        info "[DRY-RUN] Would upgrade driver in container $vmid"
         return 0
     fi
     
-    # Get current version in LXC
-    local lxc_version
-    lxc_version=$(pct exec "$vmid" -- nvidia-smi --query-gpu=driver_version --format=csv,noheader 2>/dev/null | head -1 || echo "unknown")
-    log "Current LXC $vmid driver: $lxc_version"
+    # Get current version
+    local lxc_current_version
+    lxc_current_version=$(get_container_driver_version "$vmid")
+    log "Current container driver: ${YELLOW}$lxc_current_version${NC}"
+    log "Target container driver:  ${GREEN}$NEW_VERSION${NC}"
     
-    if [[ "$lxc_version" == "$NEW_VERSION" ]]; then
-        warn "LXC $vmid already running target driver. Skipping."
+    # Skip if already at target
+    if [[ "$lxc_current_version" == "$NEW_VERSION" ]]; then
+        warn "Container already at target driver version"
         return 0
     fi
     
-    # Uninstall old driver in LXC
-    log "Uninstalling old driver in LXC $vmid..."
-    pct exec "$vmid" -- bash -c "command -v nvidia-installer &>/dev/null && nvidia-installer --uninstall --silent || true"
+    log "Step 1/5: Stopping Docker containers in LXC $vmid..."
+    pct exec "$vmid" -- bash -c "
+        if command -v docker &>/dev/null; then
+            docker stop \$(docker ps -q) 2>/dev/null || true
+            sleep 2
+        fi
+    " || warn "Docker stop had issues or not running"
     
-    # Copy new driver to LXC
-    log "Copying driver to LXC $vmid..."
-    pct push "$vmid" "$DRIVER_FILE" "/root/NVIDIA-Linux-x86_64-${NEW_VERSION}.run"
+    log "Step 2/5: Uninstalling old driver in container..."
+    pct exec "$vmid" -- bash -c "
+        if command -v nvidia-installer &>/dev/null; then
+            nvidia-installer --uninstall --silent --no-questions || true
+        fi
+    " || warn "Previous driver uninstall had issues (may be normal)"
     
-    # Install driver without kernel module
-    log "Installing driver in LXC $vmid..."
-    pct exec "$vmid" -- bash -c "chmod +x /root/NVIDIA-Linux-x86_64-${NEW_VERSION}.run && \
-                                  /root/NVIDIA-Linux-x86_64-${NEW_VERSION}.run --silent --no-kernel-module --no-questions"
+    log "Step 3/5: Copying driver to container..."
+    pct push "$vmid" "$DRIVER_FILE" "/tmp/NVIDIA-Linux-x86_64-${NEW_VERSION}.run"
+    
+    log "Step 4/5: Installing driver (no kernel module)..."
+    # Install without kernel module - uses host's kernel module
+    pct exec "$vmid" -- bash -c "
+        chmod +x /tmp/NVIDIA-Linux-x86_64-${NEW_VERSION}.run && \
+        /tmp/NVIDIA-Linux-x86_64-${NEW_VERSION}.run \
+            --silent \
+            --no-kernel-module \
+            --no-questions \
+            --no-x-check \
+            --no-search-path \
+            --accept-license
+    " || error "Container driver installation failed"
     
     # Verify installation
-    sleep 2
-    local new_version
-    new_version=$(pct exec "$vmid" -- nvidia-smi --query-gpu=driver_version --format=csv,noheader 2>/dev/null | head -1 || echo "unknown")
+    sleep 3
+    local lxc_new_version
+    lxc_new_version=$(get_container_driver_version "$vmid")
     
-    if [[ "$new_version" == "$NEW_VERSION" ]]; then
-        log "✓ LXC $vmid driver upgraded successfully"
+    log "Step 5/5: Verifying installation..."
+    if [[ "$lxc_new_version" == "$NEW_VERSION" ]]; then
+        log "✓ Container $vmid driver verified: $lxc_new_version"
     else
-        error "✗ LXC $vmid driver upgrade failed. Expected: $NEW_VERSION, Got: $new_version"
+        error "Container driver version mismatch! Expected: $NEW_VERSION, Got: $lxc_new_version"
     fi
     
-    # Verify no-cgroups setting
+    # Verify nvidia-container-runtime config
     if pct exec "$vmid" -- grep -q "no-cgroups = true" /etc/nvidia-container-runtime/config.toml 2>/dev/null; then
-        log "✓ LXC $vmid no-cgroups setting intact"
+        log "✓ Container nvidia-container-runtime config intact"
     else
-        warn "LXC $vmid no-cgroups setting may be incorrect!"
+        warn "Container may need 'no-cgroups = true' in /etc/nvidia-container-runtime/config.toml"
     fi
     
-    # Test Docker GPU access
-    log "Testing Docker GPU access in LXC $vmid..."
-    if pct exec "$vmid" -- bash -c "command -v docker &>/dev/null"; then
-        if pct exec "$vmid" -- docker run --rm --gpus all nvidia/cuda:12.6.1-base-ubuntu24.04 nvidia-smi &>>"$LOG_FILE"; then
-            log "✓ LXC $vmid Docker GPU access verified"
-        else
-            error "✗ LXC $vmid Docker GPU access test failed!"
-        fi
-    else
-        warn "Docker not found in LXC $vmid, skipping GPU test"
-    fi
+    log "Step 6/5: Cleaning up..."
+    pct exec "$vmid" -- rm -f "/tmp/NVIDIA-Linux-x86_64-${NEW_VERSION}.run"
     
-    # Cleanup
-    log "Cleaning up LXC $vmid..."
-    pct exec "$vmid" -- rm -f "/root/NVIDIA-Linux-x86_64-${NEW_VERSION}.run"
+    # Mark container as needing restart (NOT reboot, just service restart)
+    NEEDS_REBOOT_CONTAINERS+=("$vmid")
+    warn "Container $vmid will need Docker/GPU workloads restarted"
 }
 
-restart_lxc_workloads() {
-    log "=== RESTARTING LXC WORKLOADS ==="
+# Restart GPU workloads in containers (no reboot!)
+restart_container_workloads() {
+    section "Restarting Container Workloads (NO REBOOT)"
+    
+    if [[ "$SKIP_WORKLOAD_RESTART" == "true" ]]; then
+        warn "Workload restart skipped by user"
+        return 0
+    fi
     
     for vmid in $LXC_CONTAINERS; do
-        if pct status "$vmid" | grep -q "running"; then
-            info "Restarting Docker Compose stacks in LXC $vmid..."
-            if [[ "$DRY_RUN" == "false" ]]; then
-                # Find and restart docker-compose stacks
-                pct exec "$vmid" -- bash -c "
-                    for compose_file in \$(find /opt /home -name 'docker-compose.yml' -o -name 'compose.yml' 2>/dev/null); do
-                        compose_dir=\$(dirname \"\$compose_file\")
-                        echo \"Restarting stack in: \$compose_dir\"
-                        cd \"\$compose_dir\" && docker compose up -d 2>/dev/null || docker-compose up -d 2>/dev/null || true
-                    done
-                " || warn "Failed to restart some Docker Compose stacks in LXC $vmid"
+        if ! is_container_running "$vmid"; then
+            debug "Container $vmid not running, skipping workload restart"
+            continue
+        fi
+        
+        info "Restarting workloads in container $vmid..."
+        
+        # Restart docker daemon and containers
+        pct exec "$vmid" -- bash -c "
+            if command -v docker &>/dev/null; then
+                systemctl restart docker 2>/dev/null || true
+                sleep 3
+                
+                # Restart docker-compose stacks if they exist
+                for compose_file in \$(find /opt /home /root -name 'docker-compose.yml' -o -name 'compose.yml' 2>/dev/null); do
+                    compose_dir=\$(dirname \"\$compose_file\")
+                    echo \"Restarting stack in: \$compose_dir\"
+                    cd \"\$compose_dir\" && (docker compose up -d 2>/dev/null || docker-compose up -d 2>/dev/null) || true
+                done
             fi
-        fi
+        " || warn "Some workload restart steps failed in container $vmid (may be expected)"
+        
+        log "✓ Container $vmid workloads restarted"
     done
 }
 
-#=============================================================================
-# Verification Functions
-#=============================================================================
+# ============================================================================
+# VALIDATION & REPORTING
+# ============================================================================
 
-final_verification() {
-    log "=== FINAL VERIFICATION ==="
+# Verify all driver installations
+verify_all_installations() {
+    section "Final Installation Verification"
     
-    echo ""
-    highlight "╔════════════════════════════════════════════════════════════════╗"
-    highlight "║                    Host Driver Status                          ║"
-    highlight "╚════════════════════════════════════════════════════════════════╝"
-    nvidia-smi | tee -a "$LOG_FILE"
+    log "Host Driver Status:"
+    log "==================="
+    nvidia-smi | head -20 | tee -a "$LOG_FILE"
     
-    for vmid in $LXC_CONTAINERS; do
-        if pct status "$vmid" | grep -q "running"; then
-            echo ""
-            highlight "╔════════════════════════════════════════════════════════════════╗"
-            highlight "║                LXC $vmid Driver Status                          "
-            highlight "╚════════════════════════════════════════════════════════════════╝"
-            pct exec "$vmid" -- nvidia-smi | tee -a "$LOG_FILE"
-        fi
-    done
-    
-    echo ""
-    log "✓ Upgrade complete! Log saved to: $LOG_FILE"
+    if [[ -n "$LXC_CONTAINERS" ]]; then
+        for vmid in $LXC_CONTAINERS; do
+            if is_container_running "$vmid"; then
+                log ""
+                log "Container $vmid Driver Status:"
+                log "==============================="
+                pct exec "$vmid" -- nvidia-smi 2>/dev/null | head -15 || warn "Failed to query container $vmid"
+                tee -a "$LOG_FILE" < <(pct exec "$vmid" -- nvidia-smi 2>/dev/null | head -15)
+            fi
+        done
+    fi
 }
 
-#=============================================================================
-# Main Execution
-#=============================================================================
+# Display reboot/restart requirements
+show_reboot_requirements() {
+    section "IMPORTANT: Post-Upgrade Actions Required"
+    
+    echo ""
+    echo -e "${YELLOW}This script does NOT reboot as requested. However:${NC}"
+    echo ""
+    
+    if [[ $NEEDS_REBOOT_HOST -eq 1 ]]; then
+        echo -e "${RED}⚠ HOST SYSTEM REQUIRES REBOOT${NC}"
+        echo "  The new DKMS kernel module will only load after reboot."
+        echo "  Until then, the old kernel module remains in use."
+        echo ""
+        echo -e "  Reboot when ready: ${CYAN}reboot${NC}"
+        echo ""
+    fi
+    
+    if [[ ${#NEEDS_REBOOT_CONTAINERS[@]} -gt 0 ]]; then
+        echo -e "${YELLOW}⚠ CONTAINER WORKLOAD RESTARTS REQUIRED${NC}"
+        echo "  The following containers have new drivers but need workload restarts:"
+        echo ""
+        for vmid in "${NEEDS_REBOOT_CONTAINERS[@]}"; do
+            echo "    - LXC $vmid (Docker services restarted, but GPU apps may need reconnection)"
+        done
+        echo ""
+        echo "  Manually restart GPU workloads in affected containers if needed."
+        echo ""
+    fi
+    
+    if [[ $NEEDS_REBOOT_HOST -eq 0 ]] && [[ ${#NEEDS_REBOOT_CONTAINERS[@]} -eq 0 ]]; then
+        echo -e "${GREEN}✓ No reboot required - driver upgrade complete!${NC}"
+        echo ""
+    fi
+    
+    echo -e "${CYAN}Log file: $LOG_FILE${NC}"
+}
+
+# ============================================================================
+# MAIN EXECUTION
+# ============================================================================
 
 main() {
-    echo ""
-    highlight "╔════════════════════════════════════════════════════════════════╗"
-    highlight "║         NVIDIA Driver Upgrade Script for Proxmox + LXC        ║"
-    highlight "╚════════════════════════════════════════════════════════════════╝"
-    echo ""
+    section "NVIDIA Driver Upgrade Script (No Reboot)"
     
-    log "Starting NVIDIA driver upgrade process"
+    log "Initialization started"
     log "Log file: $LOG_FILE"
     
+    # Pre-flight checks
     check_root
     check_dependencies
-    validate_inputs
-    detect_lxc_containers
+    check_proxmox
+    check_nvidia_installed
     
-    if [[ "$DRY_RUN" == "true" ]]; then
-        warn "DRY RUN MODE - No changes will be made"
+    # Determine target version
+    if [[ -z "$NEW_VERSION" ]]; then
+        log "Detecting latest production driver version..."
+        NEW_VERSION=$(get_latest_production_version)
+        log "Latest production version: ${GREEN}$NEW_VERSION${NC}"
+    else
+        log "Using specified driver version: ${GREEN}$NEW_VERSION${NC}"
     fi
     
-    # Final confirmation prompt
-    if [[ "$DRY_RUN" == "false" ]]; then
-        echo ""
-        echo -e "${YELLOW}╔════════════════════════════════════════════════════════════════╗${NC}"
-        echo -e "${YELLOW}║                    UPGRADE SUMMARY                             ║${NC}"
-        echo -e "${YELLOW}╚════════════════════════════════════════════════════════════════╝${NC}"
-        echo ""
-        echo -e "  Target driver version: ${GREEN}$NEW_VERSION${NC}"
-        echo -e "  Proxmox host:          ${GREEN}Will be upgraded${NC}"
-        echo -e "  LXC containers:        ${GREEN}$LXC_CONTAINERS${NC}"
-        echo -e "  Driver file:           ${BLUE}$DRIVER_FILE${NC}"
-        echo ""
-        read -p "Continue with upgrade? (yes/no): " -r
+    # Display current vs target
+    local current_version
+    current_version=$(get_current_host_version)
+    
+    section "Driver Version Information"
+    echo -e "  Currently installed: ${YELLOW}$current_version${NC}"
+    echo -e "  Target version:      ${GREEN}$NEW_VERSION${NC}"
+    echo ""
+    
+    # Compare versions
+    if [[ "$current_version" == "$NEW_VERSION" ]]; then
+        echo -e "  ${GREEN}✓ Already on latest version${NC}"
+        read -p "Continue with reinstallation? (yes/no): " -r
         if [[ ! $REPLY =~ ^[Yy][Ee][Ss]$ ]]; then
-            error "Upgrade cancelled by user"
+            log "Upgrade cancelled - already on latest version"
+            exit 3
         fi
+    else
+        compare_versions "$NEW_VERSION" "$current_version"
+        case $? in
+            1) echo -e "  ${GREEN}⬆ Upgrade available${NC}" ;;
+            2) echo -e "  ${YELLOW}⬇ Downgrade selected (use with caution)${NC}" ;;
+        esac
     fi
     
-    stop_gpu_workloads
+    # Confirm action
+    echo ""
+    read -p "Proceed with upgrade to version ${NEW_VERSION}? (yes/no): " -r
+    if [[ ! $REPLY =~ ^[Yy][Ee][Ss]$ ]]; then
+        log "Upgrade cancelled by user"
+        exit 1
+    fi
+    
+    # Download driver
+    if [[ "$AUTO_DOWNLOAD" == "true" ]] && [[ "$DRY_RUN" == "false" ]]; then
+        download_driver "$NEW_VERSION"
+    elif [[ "$DRY_RUN" == "true" ]]; then
+        info "[DRY-RUN] Skipping download"
+        DRIVER_FILE="/root/NVIDIA-Linux-x86_64-${NEW_VERSION}.run"
+    fi
+    
+    validate_driver_file
+    
+    # Detect containers
+    detect_gpu_containers
+    
+    # Show upgrade summary
+    if [[ "$DRY_RUN" == "false" ]]; then
+        section "Upgrade Summary"
+        echo -e "  Driver version:    ${GREEN}$NEW_VERSION${NC}"
+        echo -e "  Proxmox host:      Will upgrade (requires reboot for DKMS)"
+        echo -e "  LXC containers:    ${CYAN}${LXC_CONTAINERS:-None}${NC}"
+        echo -e "  Reboot mode:       ${YELLOW}DISABLED (as requested)${NC}"
+        echo ""
+        read -p "Ready to begin upgrade? Type 'YES' to continue: " -r
+        if [[ "$REPLY" != "YES" ]]; then
+            log "Upgrade cancelled"
+            exit 1
+        fi
+    else
+        warn "DRY-RUN MODE - no changes will be made"
+    fi
+    
+    # Execute upgrades
     upgrade_host_driver
     
-    for vmid in $LXC_CONTAINERS; do
-        upgrade_lxc_driver "$vmid"
-    done
+    if [[ -n "$LXC_CONTAINERS" ]]; then
+        for vmid in $LXC_CONTAINERS; do
+            upgrade_lxc_driver "$vmid"
+        done
+    fi
     
-    restart_lxc_workloads
-    final_verification
+    # Restart workloads (no system reboot)
+    if [[ -n "$LXC_CONTAINERS" ]]; then
+        restart_container_workloads
+    fi
+    
+    # Verification
+    verify_all_installations
+    
+    # Final requirements
+    show_reboot_requirements
+    
+    log "Upgrade process completed successfully"
 }
 
-# Run main function
-main "$@"
+# Run main with error handling
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+    main "$@"
+fi

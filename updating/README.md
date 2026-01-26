@@ -1,12 +1,20 @@
-# NVIDIA Driver Upgrade Script
+# NVIDIA Driver Upgrade Script (NO REBOOT)
 
-Automated NVIDIA driver upgrades for Proxmox hosts and GPU-enabled LXC containers.
+Automated NVIDIA driver upgrades for Proxmox hosts and GPU-enabled LXC containers **without triggering system reboots**.
 
 ## Overview
 
-This script automates driver upgrades across your Proxmox infrastructure - host and all LXC containers with GPU passthrough. It auto-detects the latest driver version, downloads it, upgrades everything, and verifies the installation.
+This script:
+- **Auto-detects** latest production-branch NVIDIA driver from official servers
+- **Shows** currently installed version vs. target version
+- **Upgrades** Proxmox host with DKMS kernel module support
+- **Auto-detects** all LXC containers with GPU passthrough
+- **Upgrades** driver in each container (no kernel modules)
+- **Restarts** Docker workloads gracefully (NO SYSTEM REBOOT)
+- **Displays** post-upgrade reboot/restart requirements
+- **Logs** all actions for troubleshooting
 
-**⚠️ Important:** For initial NVIDIA setup, see the [main installation guide](../README.md).
+**Key Point:** This script is designed for production environments where reboots must be scheduled separately.
 
 ## Quick Start
 
@@ -16,118 +24,275 @@ cd /root
 wget https://raw.githubusercontent.com/Bishop-trevorstuart/Nvidia-Proxmox-LXC-Docker/main/updating/nvidia-upgrade.sh
 chmod +x nvidia-upgrade.sh
 
-# Auto-detect latest version and upgrade
+# Auto-detect latest and upgrade (recommended)
 ./nvidia-upgrade.sh
 
-# Dry run to preview changes
+# Dry-run to see what would happen
 DRY_RUN=true ./nvidia-upgrade.sh
 
 # Use specific version
-./nvidia-upgrade.sh 585.05.10
+./nvidia-upgrade.sh 550.127.05
 ```
 
-## What It Does
+## What Gets Upgraded
 
-1. Checks NVIDIA servers for latest driver version
-2. Downloads driver automatically (if needed)
-3. Upgrades Proxmox host with DKMS support
-4. Auto-discovers LXC containers with GPU passthrough
-5. Upgrades driver in each container
-6. Verifies installation and Docker GPU access
-7. Restarts Docker Compose stacks
-8. Logs everything to `/var/log/nvidia-upgrade-*.log`
+### Proxmox Host
+✓ Driver installation with DKMS kernel module (persists after kernel upgrades)
+✓ DKMS module registration
+✓ NVIDIA persistence daemon
+✗ **Does NOT reboot the host**
 
-## Usage Options
+### LXC Containers
+✓ Driver installation (no kernel modules - uses host's)
+✓ Docker service restart
+✓ Docker Compose stack restart
+✗ **Does NOT reboot containers**
+
+## Reboot Requirements
+
+### After Upgrade, You May Need To:
+
+**For Proxmox Host:**
+- ⚠️ **Reboot is required** for the new DKMS kernel module to take effect
+- Old kernel module remains in use until reboot
+- Schedule at your convenience: `reboot`
+
+**For LXC Containers:**
+- ✓ Docker services restarted automatically (no reboot needed)
+- GPU workloads restarted automatically
+- If GPU apps don't reconnect, manually restart them
+
+## Usage Modes
 
 | Mode | Command | Description |
 |------|---------|-------------|
-| **Auto (recommended)** | `./nvidia-upgrade.sh` | Auto-detect latest, download, upgrade |
-| **Dry run** | `DRY_RUN=true ./nvidia-upgrade.sh` | Preview changes without modifying system |
-| **Manual version** | `./nvidia-upgrade.sh 585.05.10` | Specify exact driver version |
-| **Skip download** | `AUTO_DOWNLOAD=false ./nvidia-upgrade.sh` | Don't auto-download driver |
-| **Manual containers** | `LXC_CONTAINERS="101 102" ./nvidia-upgrade.sh` | Override container detection |
+| **Auto (recommended)** | `./nvidia-upgrade.sh` | Detects latest, downloads, upgrades |
+| **Specific version** | `./nvidia-upgrade.sh 550.127.05` | Use exact driver version |
+| **Dry-run preview** | `DRY_RUN=true ./nvidia-upgrade.sh` | Show changes without applying |
+| **Skip download** | `AUTO_DOWNLOAD=false ./nvidia-upgrade.sh` | Use pre-downloaded driver |
+| **Manual containers** | `LXC_CONTAINERS='101 102 103' ./nvidia-upgrade.sh` | Override auto-detection |
+| **No workload restart** | `SKIP_WORKLOAD_RESTART=true ./nvidia-upgrade.sh` | Upgrade only, no restart |
 
 ## Prerequisites
 
 - Proxmox VE 8.x (Debian Bookworm)
 - Existing NVIDIA driver installation
-- Root access
-- Internet connection
-- Dependencies: `wget`, `curl`, `pct` (auto-checked)
+- Root access on Proxmox host
+- Internet connection (for driver download)
+- Dependencies: `wget curl pct nvidia-smi dkms`
 
-## Upgrade Process
+All checked automatically before upgrade.
 
-### Proxmox Host
-1. Uninstall old driver and DKMS modules
-2. Install new driver with `--dkms` flag for kernel upgrade support
-3. Verify DKMS registration and persistence daemon
+## How It Works
 
-### LXC Containers
-1. Copy driver to container
-2. Install with `--no-kernel-module` flag (uses host kernel module)
-3. Test Docker GPU access with CUDA container
-4. Verify `no-cgroups = true` setting
-
-## NVIDIA Container Toolkit
-
-The toolkit updates **separately** via `apt` and doesn't need this script:
-
-```bash
-# Inside each LXC - part of normal updates
-apt update && apt upgrade
+### Version Detection
+```
+1. Queries NVIDIA official servers for latest production version
+2. Compares with currently installed version
+3. Shows side-by-side comparison
+4. Asks for confirmation before proceeding
 ```
 
-The toolkit is decoupled from the driver - it just passes GPU devices to Docker. As long as `no-cgroups = true` stays in `/etc/nvidia-container-runtime/config.toml`, updates are safe.
+### Host Upgrade
+```
+1. Stops Docker services
+2. Uninstalls old driver
+3. Removes old DKMS modules
+4. Installs new driver with DKMS
+5. Verifies installation
+6. Registers DKMS kernel module
+7. Restarts NVIDIA persistence daemon
+```
+
+### Container Upgrade
+```
+1. Starts container if stopped
+2. Stops Docker workloads gracefully
+3. Uninstalls old driver
+4. Copies new driver to container
+5. Installs driver (no kernel module)
+6. Verifies installation
+7. Restarts Docker daemon
+8. Auto-restarts Docker Compose stacks
+```
+
+## Output Example
+
+```
+╔══════════════════════════════════════════════════════════════╗
+║         NVIDIA Driver Upgrade Script (No Reboot)            ║
+╚══════════════════════════════════════════════════════════════╝
+
+[2026-01-26 01:50:39] Initialization started
+[INFO] ✓ Proxmox VE is running
+[INFO] ✓ NVIDIA driver is installed
+[INFO] Querying NVIDIA for latest production driver version...
+[INFO] Latest production version: 550.127.05
+
+╔══════════════════════════════════════════════════════════════╗
+║              Driver Version Information                      ║
+╚══════════════════════════════════════════════════════════════╝
+
+  Currently installed: 550.100.04
+  Target version:      550.127.05
+  ⬆ Upgrade available
+
+Proceed with upgrade to version 550.127.05? (yes/no): yes
+
+[INFO] Downloading NVIDIA driver 550.127.05...
+✓ Download complete (614MB)
+
+╔══════════════════════════════════════════════════════════════╗
+║              Upgrading Proxmox Host Driver                  ║
+╚══════════════════════════════════════════════════════════════╝
+
+[2026-01-26 01:50:39] Current host driver: 550.100.04
+[2026-01-26 01:50:39] Target host driver:  550.127.05
+[2026-01-26 01:50:40] Step 1/4: Stopping GPU workloads...
+[2026-01-26 01:50:42] Step 2/4: Uninstalling current driver...
+[2026-01-26 01:50:55] Step 3/4: Cleaning DKMS modules...
+[2026-01-26 01:51:02] Step 4/4: Installing new driver with DKMS...
+✓ Host driver installation successful
+✓ Host driver version verified: 550.127.05
+✓ DKMS module registered
+✓ NVIDIA persistence daemon restarted
+⚠ Host will need reboot for DKMS kernel module to take effect
+
+╔══════════════════════════════════════════════════════════════╗
+║              Auto-detected GPU Containers                    ║
+╚══════════════════════════════════════════════════════════════╝
+
+✓ Auto-detected GPU containers: 101 102
+
+╔══════════════════════════════════════════════════════════════╗
+║              Upgrading LXC Container 101                     ║
+╚══════════════════════════════════════════════════════════════╝
+
+✓ Container 101 driver verified: 550.127.05
+✓ Container 101 workloads restarted
+
+╔══════════════════════════════════════════════════════════════╗
+║        IMPORTANT: Post-Upgrade Actions Required             ║
+╚══════════════════════════════════════════════════════════════╝
+
+⚠ HOST SYSTEM REQUIRES REBOOT
+  The new DKMS kernel module will only load after reboot.
+  Reboot when ready: reboot
+
+Log file: /var/log/nvidia-upgrade-20260126-015039.log
+```
 
 ## Troubleshooting
 
-**Containers not detected:**
+### Driver download fails
 ```bash
-LXC_CONTAINERS="101 102 103" ./nvidia-upgrade.sh
+# Download manually
+wget https://download.nvidia.com/XFree86/Linux-x86_64/550.127.05/NVIDIA-Linux-x86_64-550.127.05.run
+
+# Then run script with AUTO_DOWNLOAD=false
+AUTO_DOWNLOAD=false ./nvidia-upgrade.sh 550.127.05
 ```
 
-**Download fails:**
+### Containers not auto-detected
 ```bash
-wget https://download.nvidia.com/XFree86/Linux-x86_64/XXX.XX.XX/NVIDIA-Linux-x86_64-XXX.XX.XX.run
+# Manually specify containers
+LXC_CONTAINERS='101 102 103' ./nvidia-upgrade.sh
 ```
 
-**Docker GPU test fails in container:**
+### Docker GPU test fails in container
 ```bash
-# Check no-cgroups setting
+# Inside container, verify no-cgroups setting
 grep "no-cgroups" /etc/nvidia-container-runtime/config.toml
 # Should show: no-cgroups = true
 
-# Reconfigure if needed
+# If missing, reconfigure
 nvidia-ctk runtime configure --runtime=docker
 systemctl restart docker
 ```
 
-**View logs:**
+### View detailed logs
 ```bash
+# Find latest log
 tail -f /var/log/nvidia-upgrade-*.log
+
+# Or enable debug output
+DEBUG=1 ./nvidia-upgrade.sh
 ```
 
-## Kernel Upgrades
+### Verify DKMS module status
+```bash
+# Check DKMS registration
+dkms status
 
-After Proxmox kernel upgrades, DKMS automatically rebuilds driver modules - **you don't need this script**. Just reboot and verify:
+# After reboot, verify module loaded
+grep nvidia /proc/modules
+
+# Check driver
+nvidia-smi
+```
+
+## Post-Reboot Verification
+
+After rebooting the Proxmox host:
 
 ```bash
-dkms status    # Check module rebuilt
+# Verify DKMS module rebuilt for new kernel
+dkms status
+
+# Verify driver still working
+nvidia-smi
+
+# Check for GPU errors
+nvidia-smi -q
+
+# Test containers
+pct exec 101 -- nvidia-smi
+```
+
+## Kernel Upgrade Handling
+
+After a Proxmox kernel upgrade, DKMS automatically rebuilds the driver module. **You don't need this script.** Just reboot:
+
+```bash
+reboot
+
+# After reboot
+dkms status    # Check DKMS auto-rebuild
 nvidia-smi     # Verify driver works
 ```
 
+## Key Differences from Previous Version
+
+| Feature | Old | New |
+|---------|-----|-----|
+| Latest version detection | Semi-manual | Production-branch auto-detect |
+| Show installed version | No | Yes, with comparison |
+| No reboot option | No | Yes (explicit) |
+| Container detection | Basic | Improved config parsing |
+| Reboot requirements | Not shown | Clearly displayed |
+| Error handling | Basic | Robust with recovery |
+| DKMS support | Present | Improved verification |
+
 ## Time Estimates
 
-- 1 container: ~30 minutes
-- 3 containers: ~60 minutes
-- 5+ containers: ~90 minutes
+- **1 container:** ~30 minutes
+- **3 containers:** ~60 minutes  
+- **5+ containers:** ~90 minutes
+
+(Includes download time; cached drivers are much faster)
 
 ## Related Documentation
 
 - [Initial NVIDIA GPU Setup](../README.md)
 - [NVIDIA Driver Installation Guide](https://docs.nvidia.com/datacenter/tesla/driver-installation-guide/)
-- [NVIDIA Container Toolkit Docs](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/install-guide.html)
+- [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/)
+- [DKMS Documentation](https://help.ubuntu.com/community/DKMS)
 
 ## License
 
 MIT License - See [LICENSE](../LICENSE)
+
+---
+
+**Last Updated:** 2026-01-26
+**Tested on:** Proxmox VE 8.x (Debian Bookworm), NVIDIA driver 550.x branch

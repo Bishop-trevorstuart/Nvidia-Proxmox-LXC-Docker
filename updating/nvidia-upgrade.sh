@@ -61,7 +61,11 @@ upgrade_host() {
   run ./NVIDIA-Linux-x86_64-$NEW_VERSION.run --dkms --silent
 
   run modprobe nvidia_uvm
-  grep -q nvidia_uvm /etc/modules || echo nvidia_uvm >> /etc/modules
+  if [[ "$DRY_RUN" != "true" ]]; then
+    grep -q nvidia_uvm /etc/modules || echo nvidia_uvm >> /etc/modules
+  else
+    echo "[DRY RUN] ensure nvidia_uvm in /etc/modules"
+  fi
 
   run systemctl start docker || true
 
@@ -76,25 +80,24 @@ upgrade_container() {
 
   run pct exec "$vmid" -- bash -c "
     set -e
-
     cd /tmp
-
     wget -q https://us.download.nvidia.com/XFree86/Linux-x86_64/$VERSION/NVIDIA-Linux-x86_64-$VERSION.run
     chmod +x NVIDIA-Linux-x86_64-$VERSION.run
-
     ./NVIDIA-Linux-x86_64-$VERSION.run --no-kernel-module --silent
-
     sed -i 's/^#\\?no-cgroups.*/no-cgroups = true/' /etc/nvidia-container-runtime/config.toml
-
     nvidia-ctk runtime configure --runtime=docker
     systemctl restart docker
   "
 
   log "Validating Docker GPU in container $vmid..."
 
-  run pct exec "$vmid" -- docker run --rm --gpus all nvidia/cuda:12.6.1-base-ubuntu24.04 nvidia-smi >/dev/null 2>&1 \
-    && log "✓ GPU OK in container $vmid" \
-    || warn "GPU FAILED in container $vmid"
+  if [[ "$DRY_RUN" == "true" ]]; then
+    log "[DRY RUN] Skipping GPU validation in container $vmid"
+  else
+    pct exec "$vmid" -- docker run --rm --gpus all nvidia/cuda:12.6.1-base-ubuntu24.04 nvidia-smi >/dev/null 2>&1 \
+      && log "✓ GPU OK in container $vmid" \
+      || warn "GPU FAILED in container $vmid"
+  fi
 }
 
 find_gpu_containers() {

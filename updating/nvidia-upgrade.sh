@@ -56,7 +56,9 @@ upgrade_host() {
   run wget -q https://us.download.nvidia.com/XFree86/Linux-x86_64/$NEW_VERSION/NVIDIA-Linux-x86_64-$NEW_VERSION.run
   run chmod +x NVIDIA-Linux-x86_64-$NEW_VERSION.run
 
-  run systemctl stop docker || true
+  if systemctl list-units --type=service | grep -q docker; then
+    run systemctl stop docker
+  fi
 
   run ./NVIDIA-Linux-x86_64-$NEW_VERSION.run --dkms --silent
 
@@ -67,7 +69,9 @@ upgrade_host() {
     echo "[DRY RUN] ensure nvidia_uvm in /etc/modules"
   fi
 
-  run systemctl start docker || true
+  if systemctl list-units --type=service | grep -q docker; then
+    run systemctl start docker
+  fi
 
   log "✓ Host upgraded"
 }

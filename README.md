@@ -49,10 +49,10 @@ reboot
 > This guide uses `.run` for consistency across Proxmox and mixed LXC environments.
 
 ```bash
-wget https://us.download.nvidia.com/XFree86/Linux-x86_64/580.105.08/NVIDIA-Linux-x86_64-580.105.08.run
-chmod +x NVIDIA-Linux-x86_64-580.105.08.run
+wget https://us.download.nvidia.com/XFree86/Linux-x86_64/580.142/NVIDIA-Linux-x86_64-580.142.run
+chmod +x NVIDIA-Linux-x86_64-580.142.run
 
-./NVIDIA-Linux-x86_64-580.105.08.run --dkms
+./NVIDIA-Linux-x86_64-580.142.run --dkms
 ```
 
 Selections:

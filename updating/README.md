@@ -89,3 +89,18 @@ docker run --rm --gpus all nvidia/cuda:12.6.1-base-ubuntu24.04 nvidia-smi
 * Does NOT modify LXC configs
 * Does NOT manage application containers
 * UVM is automatically ensured during upgrade
+Safe check
+DRY_RUN=true ./nvidia-upgrade.sh
+Normal (safe mode)
+./nvidia-upgrade.sh
+
+👉 Will refuse if GPU in use
+
+Forced full upgrade + restore
+./nvidia-upgrade.sh --force
+
+👉 Will:
+
+stop compose stacks
+upgrade driver
+bring compose stacks back up

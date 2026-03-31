@@ -28,6 +28,13 @@ Updates NVIDIA drivers across:
 ---
 
 ## Run
+# Get script (choose one)
+
+# Option 1: clone repo
+git clone https://github.com/Bishop-trevorstuart/Nvidia-Proxmox-LXC-Docker.git
+
+# Option 2: download directly
+wget https://raw.githubusercontent.com/Bishop-trevorstuart/Nvidia-Proxmox-LXC-Docker/main/updating/nvidia-upgrade.sh
 
 ```bash
 chmod +x nvidia-upgrade.sh
